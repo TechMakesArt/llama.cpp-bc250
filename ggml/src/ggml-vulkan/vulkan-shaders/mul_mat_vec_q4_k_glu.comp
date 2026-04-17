@@ -1,0 +1,174 @@
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "mul_mat_vec_glu_base.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+FLOAT_TYPE temp_gate[NUM_COLS][NUM_ROWS];
+FLOAT_TYPE temp_up  [NUM_COLS][NUM_ROWS];
+
+// Process one superblock worth of Q4_K for both the gate and up matrices.
+//
+// Structure: for each output row, read B once per column, then do gate's
+// unpack+dot inside a scope and up's unpack+dot inside a separate scope.
+// The GLSL compiler treats each scope's locals as expiring at scope end,
+// so gate's 24 unpacked values can be reused as registers for up's values.
+// This halves peak register pressure vs declaring all 48 values at once.
+//
+// Valid only for NUM_COLS=1 (GLU-fused path is decode-only). For NUM_COLS>1
+// the j-loop would repeat the unpack per column; we accept that trade-off
+// since the dispatcher only activates this kernel when ne11==1.
+void calc_superblock_fused(const uint a_offset, const uint b_offset, const uint v_im,
+                           const uint q_offset, const uint y_offset, const uint i,
+                           const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
+    const uint y1_idx = i * QUANT_K + y_offset;
+    const uint y2_idx = y1_idx + 128;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            // B reads — shared between gate and up dot products below.
+            const vec4 by10  = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4    ]);
+            const vec4 by132 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4 + 8]);
+            const vec4 by20  = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4    ]);
+            const vec4 by232 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4 + 8]);
+
+            // ------------------------------------------------------------
+            // GATE scope — unpack weights, compute dot, accumulate. All
+            // gate-local constants drop out of live range at the closing brace.
+            {
+                const FLOAT_TYPEV2 dm = FLOAT_TYPEV2(data_a1[ib0 + i].dm);
+
+                const uint32_t scale0_u32 = data_a1_packed16[ib0 + i].scales[v_im    ];
+                const uint32_t scale4_u32 = data_a1_packed16[ib0 + i].scales[v_im + 2];
+                const uint32_t scale8_u32 = data_a1_packed16[ib0 + i].scales[v_im + 4];
+
+                const uint32_t scale_0_4_l = (scale4_u32 << 16) | scale0_u32;
+                const uint32_t scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0) >> 2;
+                const vec4 scale_0_4_l_f = vec4(unpack8(scale_0_4_l & 0x3F3F3F3F));
+                const vec4 scale8_f = vec4(unpack8((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0F) | scale_0_4_h));
+
+                const FLOAT_TYPE sc0 = scale_0_4_l_f.x;  const FLOAT_TYPE sc1 = scale_0_4_l_f.y;
+                const FLOAT_TYPE sc2 = scale_0_4_l_f.z;  const FLOAT_TYPE sc3 = scale_0_4_l_f.w;
+                const FLOAT_TYPE sc4 = scale8_f.x;       const FLOAT_TYPE sc5 = scale8_f.y;
+                const FLOAT_TYPE sc6 = scale8_f.z;       const FLOAT_TYPE sc7 = scale8_f.w;
+
+                const uint32_t qs0_u32  = data_a1_packed32[ib0 + i].qs[q_offset / 4];
+                const uint32_t qs64_u32 = data_a1_packed32[ib0 + i].qs[q_offset / 4 + 16];
+
+                const vec4 qs0_lo4  = vec4(unpack8( qs0_u32        & 0x0F0F0F0F));
+                const vec4 qs64_lo4 = vec4(unpack8( qs64_u32       & 0x0F0F0F0F));
+                const vec4 qs0_hi4  = vec4(unpack8((qs0_u32  >> 4) & 0x0F0F0F0F));
+                const vec4 qs64_hi4 = vec4(unpack8((qs64_u32 >> 4) & 0x0F0F0F0F));
+
+                const FLOAT_TYPE sx = fma(FLOAT_TYPE(by10.x),  qs0_lo4.x,  fma(FLOAT_TYPE(by10.y),  qs0_lo4.y,  fma(FLOAT_TYPE(by10.z),  qs0_lo4.z,  FLOAT_TYPE(by10.w)  * qs0_lo4.w)));
+                const FLOAT_TYPE sy = fma(FLOAT_TYPE(by132.x), qs0_hi4.x,  fma(FLOAT_TYPE(by132.y), qs0_hi4.y,  fma(FLOAT_TYPE(by132.z), qs0_hi4.z,  FLOAT_TYPE(by132.w) * qs0_hi4.w)));
+                const FLOAT_TYPE sz = fma(FLOAT_TYPE(by20.x),  qs64_lo4.x, fma(FLOAT_TYPE(by20.y),  qs64_lo4.y, fma(FLOAT_TYPE(by20.z),  qs64_lo4.z, FLOAT_TYPE(by20.w)  * qs64_lo4.w)));
+                const FLOAT_TYPE sw = fma(FLOAT_TYPE(by232.x), qs64_hi4.x, fma(FLOAT_TYPE(by232.y), qs64_hi4.y, fma(FLOAT_TYPE(by232.z), qs64_hi4.z, FLOAT_TYPE(by232.w) * qs64_hi4.w)));
+                // Algebraic restructure: (a+b+c+d)*s instead of 16 FMAs with repeated scales.
+                // Use dot() so the compiler can emit a horizontal-sum instruction.
+                const vec4 ones4 = vec4(1.0);
+                const FLOAT_TYPE s_by10  = FLOAT_TYPE(dot(by10,  ones4));
+                const FLOAT_TYPE s_by132 = FLOAT_TYPE(dot(by132, ones4));
+                const FLOAT_TYPE s_by20  = FLOAT_TYPE(dot(by20,  ones4));
+                const FLOAT_TYPE s_by232 = FLOAT_TYPE(dot(by232, ones4));
+                const FLOAT_TYPE smin = fma(s_by10, sc2, fma(s_by132, sc3, fma(s_by20, sc6, s_by232 * sc7)));
+                temp_gate[j][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp_gate[j][n]));
+            }
+
+            // ------------------------------------------------------------
+            // UP scope — gate's locals are out of scope now, so the compiler
+            // can reuse those registers for the up unpacked values.
+            {
+                const FLOAT_TYPEV2 dm = FLOAT_TYPEV2(data_a2[ib0 + i].dm);
+
+                const uint32_t scale0_u32 = data_a2_packed16[ib0 + i].scales[v_im    ];
+                const uint32_t scale4_u32 = data_a2_packed16[ib0 + i].scales[v_im + 2];
+                const uint32_t scale8_u32 = data_a2_packed16[ib0 + i].scales[v_im + 4];
+
+                const uint32_t scale_0_4_l = (scale4_u32 << 16) | scale0_u32;
+                const uint32_t scale_0_4_h = (scale_0_4_l & 0xC0C0C0C0) >> 2;
+                const vec4 scale_0_4_l_f = vec4(unpack8(scale_0_4_l & 0x3F3F3F3F));
+                const vec4 scale8_f = vec4(unpack8((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0F) | scale_0_4_h));
+
+                const FLOAT_TYPE sc0 = scale_0_4_l_f.x;  const FLOAT_TYPE sc1 = scale_0_4_l_f.y;
+                const FLOAT_TYPE sc2 = scale_0_4_l_f.z;  const FLOAT_TYPE sc3 = scale_0_4_l_f.w;
+                const FLOAT_TYPE sc4 = scale8_f.x;       const FLOAT_TYPE sc5 = scale8_f.y;
+                const FLOAT_TYPE sc6 = scale8_f.z;       const FLOAT_TYPE sc7 = scale8_f.w;
+
+                const uint32_t qs0_u32  = data_a2_packed32[ib0 + i].qs[q_offset / 4];
+                const uint32_t qs64_u32 = data_a2_packed32[ib0 + i].qs[q_offset / 4 + 16];
+
+                const vec4 qs0_lo4  = vec4(unpack8( qs0_u32        & 0x0F0F0F0F));
+                const vec4 qs64_lo4 = vec4(unpack8( qs64_u32       & 0x0F0F0F0F));
+                const vec4 qs0_hi4  = vec4(unpack8((qs0_u32  >> 4) & 0x0F0F0F0F));
+                const vec4 qs64_hi4 = vec4(unpack8((qs64_u32 >> 4) & 0x0F0F0F0F));
+
+                const FLOAT_TYPE sx = fma(FLOAT_TYPE(by10.x),  qs0_lo4.x,  fma(FLOAT_TYPE(by10.y),  qs0_lo4.y,  fma(FLOAT_TYPE(by10.z),  qs0_lo4.z,  FLOAT_TYPE(by10.w)  * qs0_lo4.w)));
+                const FLOAT_TYPE sy = fma(FLOAT_TYPE(by132.x), qs0_hi4.x,  fma(FLOAT_TYPE(by132.y), qs0_hi4.y,  fma(FLOAT_TYPE(by132.z), qs0_hi4.z,  FLOAT_TYPE(by132.w) * qs0_hi4.w)));
+                const FLOAT_TYPE sz = fma(FLOAT_TYPE(by20.x),  qs64_lo4.x, fma(FLOAT_TYPE(by20.y),  qs64_lo4.y, fma(FLOAT_TYPE(by20.z),  qs64_lo4.z, FLOAT_TYPE(by20.w)  * qs64_lo4.w)));
+                const FLOAT_TYPE sw = fma(FLOAT_TYPE(by232.x), qs64_hi4.x, fma(FLOAT_TYPE(by232.y), qs64_hi4.y, fma(FLOAT_TYPE(by232.z), qs64_hi4.z, FLOAT_TYPE(by232.w) * qs64_hi4.w)));
+                // Algebraic restructure: (a+b+c+d)*s instead of 16 FMAs with repeated scales.
+                // Use dot() so the compiler can emit a horizontal-sum instruction.
+                const vec4 ones4 = vec4(1.0);
+                const FLOAT_TYPE s_by10  = FLOAT_TYPE(dot(by10,  ones4));
+                const FLOAT_TYPE s_by132 = FLOAT_TYPE(dot(by132, ones4));
+                const FLOAT_TYPE s_by20  = FLOAT_TYPE(dot(by20,  ones4));
+                const FLOAT_TYPE s_by232 = FLOAT_TYPE(dot(by232, ones4));
+                const FLOAT_TYPE smin = fma(s_by10, sc2, fma(s_by132, sc3, fma(s_by20, sc6, s_by232 * sc7)));
+                temp_up[j][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp_up[j][n]));
+            }
+        }
+    }
+}
+
+void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+    uint a_offset, b_offset, d_offset;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    const uint num_blocks_per_row = p.ncols / QUANT_K;
+
+    const uint it_size = gl_WorkGroupSize.x/16;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint itid = tid%16;
+    const uint ix = tid/16;
+
+    const uint il = itid/4;
+    const uint ir = itid - 4*il;
+    const uint n =  4;
+
+    const uint v_im = il / 2;
+    const uint v_in = il % 2;
+
+    const uint l0 = n * (2 * ir + v_in);
+    const uint q_offset = 32*v_im + l0;
+    const uint y_offset = 64*v_im + l0;
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp_gate[j][i] = FLOAT_TYPE(0);
+            temp_up  [j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size)
+        calc_superblock_fused(a_offset, b_offset, v_im, q_offset, y_offset, i, num_blocks_per_row, first_row, num_rows);
+
+    reduce_result_glu(temp_gate, temp_up, d_offset, first_row, num_rows, tid);
+}
+
+void main() {
+    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+
+    if (first_row + NUM_ROWS <= p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    } else {
+        if (first_row >= p.stride_d) {
+            return;
+        }
+        compute_outputs(first_row, p.stride_d - first_row);
+    }
+}

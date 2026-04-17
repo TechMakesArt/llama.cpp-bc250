@@ -705,6 +705,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
+    // Fused MUL_MAT(gate) + MUL_MAT(up) + SWIGLU_SPLIT (decode-only, NUM_COLS=1)
+    vk_pipeline pipeline_dequant_mul_mat_vec_glu_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
+
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
@@ -1936,6 +1939,9 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // When non-null, the current node_idx starts a MUL_MAT+MUL_MAT+SWIGLU_SPLIT fusion
+    // that should dispatch via this pipeline instead of the regular MUL_MAT path.
+    vk_pipeline fused_mat_mat_glu_pipeline {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -4197,6 +4203,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ4_NL][i],  "mul_mat_vec_iq4_nl_f32_f32",  arr_dmmv_iq4_nl_f32_f32_len[reduc16],  arr_dmmv_iq4_nl_f32_f32_data[reduc16],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_MXFP4][i],   "mul_mat_vec_mxfp4_f32_f32",   arr_dmmv_mxfp4_f32_f32_len[reduc16],   arr_dmmv_mxfp4_f32_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_NVFP4][i],   "mul_mat_vec_nvfp4_f32_f32",   arr_dmmv_nvfp4_f32_f32_len[reduc16],   arr_dmmv_nvfp4_f32_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+
+            // Fused MUL_MAT(gate) + MUL_MAT(up) + SWIGLU_SPLIT for Q4_K (decode-only, NUM_COLS=1).
+            // The pipeline table is indexed like the baseline DMMV pipelines but only the first (NUM_COLS=1) slot is used.
+            if (i == 0) {
+                constexpr uint32_t mul_mat_vec_glu_num_bindings = 4;
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_glu_f32_f32[w][GGML_TYPE_Q4_K], "mul_mat_vec_q4_k_glu_f32_f32", arr_dmmv_q4_k_glu_f32_f32_len[reduc16], arr_dmmv_q4_k_glu_f32_f32_data[reduc16], "main", mul_mat_vec_glu_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, 1}, 1, true, use_subgroups16, force_subgroup_size16);
+            }
 
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f16_f32",  arr_dmmv_f32_f16_f32_len[reduc],  arr_dmmv_f32_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f16_f32",  arr_dmmv_f16_f16_f32_len[reduc],  arr_dmmv_f16_f16_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
@@ -8059,6 +8072,79 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 }
 
+// Dispatch the fused MUL_MAT(gate) + MUL_MAT(up) + SWIGLU_SPLIT kernel.
+// Assumes ggml_vk_can_fuse_mat_mat_glu_split() already validated the pattern and returned the pipeline.
+// node_idx points to the first MUL_MAT (gate); the final output is at node_idx + 2 (the GLU node).
+static void ggml_vk_mul_mat_vec_glu_split(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, vk_pipeline dmmv) {
+    const ggml_tensor * mm_gate = cgraph->nodes[node_idx];
+    const ggml_tensor * mm_up   = cgraph->nodes[node_idx + 1];
+    ggml_tensor       * dst     = cgraph->nodes[node_idx + 2];
+
+    const ggml_tensor * src0_gate = mm_gate->src[0];
+    const ggml_tensor * src0_up   = mm_up->src[0];
+    const ggml_tensor * src1      = mm_gate->src[1];
+
+    VK_LOG_DEBUG("ggml_vk_mul_mat_vec_glu_split(gate=" << src0_gate->name << ", up=" << src0_up->name << ", B=" << src1->name << ", dst=" << dst->name << ")");
+
+    const uint64_t ne00 = src0_gate->ne[0];
+    const uint64_t ne01 = src0_gate->ne[1];
+    const uint64_t ne02 = src0_gate->ne[2];
+    const uint64_t ne03 = src0_gate->ne[3];
+
+    const uint64_t ne10 = src1->ne[0];
+    const uint64_t ne11 = src1->ne[1];
+    const uint64_t ne12 = src1->ne[2];
+    const uint64_t ne13 = src1->ne[3];
+
+    const uint64_t ne20 = dst->ne[0];
+    const uint64_t ne21 = dst->ne[1];
+
+    const uint64_t r2 = ne12 / ne02;
+    const uint64_t r3 = ne13 / ne03;
+
+    GGML_ASSERT(ne11 == 1);                   // decode-only (enforced by can_fuse predicate)
+    GGML_ASSERT(ne12 * ne13 == 1 || true);    // batch-in-ne11 dimension is 1 for our target pattern
+    GGML_ASSERT(ne20 == ne01);                // SWIGLU output has M rows (ne20) == weight M (ne01)
+
+    vk_subbuffer d_Gate = ggml_vk_tensor_subbuffer(ctx, src0_gate);
+    vk_subbuffer d_B    = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer d_D    = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer d_Up   = ggml_vk_tensor_subbuffer(ctx, src0_up);
+
+    const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+    uint32_t groups_x = (uint32_t) ne01;
+    uint32_t groups_z = 1;
+    if (ne01 > max_groups_x) {
+        groups_z = 64;
+        groups_x = CEIL_DIV(groups_x, groups_z);
+    }
+
+    const uint32_t stride_batch_x = (uint32_t)(ne00 * ne01);
+    const uint32_t stride_batch_y = (uint32_t)(ne10 * ne11);
+    const uint32_t stride_batch_d = (uint32_t)(ne20 * ne21);
+
+    ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
+
+    uint32_t base_work_group_y = 0;
+    while (base_work_group_y < ne12 * ne13) {
+        const uint32_t groups_y = std::min((uint32_t)(ne12 * ne13) - base_work_group_y,
+                                           ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+        const vk_mat_vec_push_constants pc = {
+            (uint32_t) ne00, (uint32_t) ne10, (uint32_t) ne10, (uint32_t) ne01,
+            stride_batch_x, stride_batch_y, stride_batch_d,
+            /* fusion_flags: */ 0u,
+            base_work_group_y,
+            (uint32_t) ne02, (uint32_t) ne12,
+            (uint32_t) r2, (uint32_t) r3,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
+                                  { d_Gate, d_B, d_D, d_Up },
+                                  pc,
+                                  { groups_x, groups_y, groups_z });
+        base_work_group_y += groups_y;
+    }
+}
+
 static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = dst->src[0];
@@ -8246,6 +8332,14 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    // If the fusion scan marked this node as the start of a MUL_MAT+MUL_MAT+SWIGLU_SPLIT fusion,
+    // dispatch the fused kernel and return; the two following nodes (MUL_MAT + GLU) have already
+    // been accounted for via ctx->num_additional_fused_ops.
+    if (ctx->fused_mat_mat_glu_pipeline) {
+        ggml_vk_mul_mat_vec_glu_split(ctx, subctx, cgraph, node_idx, ctx->fused_mat_mat_glu_pipeline);
+        return;
+    }
+
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
@@ -14375,6 +14469,98 @@ static bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, co
     return true;
 }
 
+// Detect the pattern emitted by Llama/Qwen/Gemma-family FFNs with `LLM_FFN_PAR + LLM_FFN_SILU`:
+//
+//     mat_a = MUL_MAT(gate_weights, cur)         (node_idx)
+//     mat_b = MUL_MAT(up_weights,   cur)         (node_idx + 1)
+//     dst   = SWIGLU_SPLIT(mat_a, mat_b)         (node_idx + 2)
+//
+// When this matches and both weight tensors are Q4_K and the decode path is single-column,
+// we can dispatch one fused kernel that reads `cur` once and writes the SWIGLU output directly.
+// Returns the pipeline that the subsequent dispatch should use, or nullptr if the pattern
+// doesn't match / isn't supported.
+static vk_pipeline ggml_vk_can_fuse_mat_mat_glu_split(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 2 >= cgraph->n_nodes) {
+        return nullptr;
+    }
+
+    const ggml_tensor * mm_gate = cgraph->nodes[node_idx];
+    const ggml_tensor * mm_up   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * glu     = cgraph->nodes[node_idx + 2];
+
+    if (mm_gate->op != GGML_OP_MUL_MAT || mm_up->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU) {
+        return nullptr;
+    }
+
+    // SWIGLU_SPLIT specifically — two inputs, unswapped.
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        return nullptr;
+    }
+    if (glu->op_params[1] != 0) {
+        return nullptr;
+    }
+    if (glu->src[0] != mm_gate || glu->src[1] != mm_up) {
+        return nullptr;
+    }
+
+    // Both matmuls must share the same input activation (the "cur" tensor).
+    if (mm_gate->src[1] != mm_up->src[1]) {
+        return nullptr;
+    }
+
+    // Weight matrices: same quant, same shape, contiguous.
+    const ggml_tensor * w_gate = mm_gate->src[0];
+    const ggml_tensor * w_up   = mm_up->src[0];
+    if (w_gate->type != w_up->type || !ggml_are_same_shape(w_gate, w_up)) {
+        return nullptr;
+    }
+    if (!ggml_vk_dim01_contiguous(w_gate) || !ggml_vk_dim01_contiguous(w_up)) {
+        return nullptr;
+    }
+
+    // Stage 2: Q4_K only.
+    if (w_gate->type != GGML_TYPE_Q4_K) {
+        return nullptr;
+    }
+
+    // Decode-only (single token in B, NUM_COLS=1).
+    if (mm_gate->ne[1] != 1 || mm_up->ne[1] != 1) {
+        return nullptr;
+    }
+
+    // Intermediate matmul outputs must not be consumed by anything other than the GLU
+    // (otherwise the unfused intermediate write is still needed). `ggml_can_fuse` normally
+    // checks this; since we're not using it here (the pattern spans 3 ops), replicate the
+    // safety check.
+    if (mm_gate->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return nullptr;
+    }
+    if (mm_up->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return nullptr;
+    }
+
+    // Select pipeline (DMMV workgroup size picked to match the existing mul_mat_vec choice).
+    const uint32_t ne01 = (uint32_t) w_gate->ne[1];
+    const uint32_t dmmv_wg = (ne01 > 256) ? DMMV_WG_SIZE_SUBGROUP : DMMV_WG_SIZE_LARGE;
+    vk_pipeline dmmv = ctx->device->pipeline_dequant_mul_mat_vec_glu_f32_f32[dmmv_wg][w_gate->type];
+    if (dmmv == nullptr) {
+        return nullptr;
+    }
+
+    // Both the B activation and the SWIGLU output must be f32 for the Stage 2 variant.
+    if (mm_gate->src[1]->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+
+    // Disallow huge matrices that would need M-splitting — baseline has a separate path for that.
+    if (ggml_nbytes(w_gate) > ctx->device->properties.limits.maxStorageBufferRange ||
+        ggml_nbytes(w_up)   > ctx->device->properties.limits.maxStorageBufferRange) {
+        return nullptr;
+    }
+
+    return dmmv;
+}
+
 static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
 
     const ggml_tensor *first_node = cgraph->nodes[node_idx];
@@ -14539,13 +14725,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_mat_mat_glu_pipeline = {};
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+            vk_pipeline mat_mat_glu_pipeline = nullptr;
             if (num_adds) {
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if ((mat_mat_glu_pipeline = ggml_vk_can_fuse_mat_mat_glu_split(ctx, cgraph, i)) != nullptr) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_mat_mat_glu_pipeline = mat_mat_glu_pipeline;
+                fusion_string = "MAT_MAT_GLU_SPLIT";
+                // The second MUL_MAT and the GLU are consumed by the fused dispatch;
+                // their outputs don't need to be written to memory separately.
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";

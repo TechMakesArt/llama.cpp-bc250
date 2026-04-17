@@ -4139,6 +4139,12 @@ static void ggml_vk_load_shaders(vk_device& device) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
+    // BC-250 fork: RDNA1 benefits from 4 output rows/workgroup on K-quants. The default of 2
+    // under-utilizes the workgroup; GCN already uses 4 (see block above). On gfx1013 this gave
+    // +3% tg across K-quants with no register spills and matching perplexity.
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA1) {
+        rm_kq = 4;
+    }
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;

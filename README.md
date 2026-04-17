@@ -210,12 +210,14 @@ Expect ~55 tok/s tg on 9B Q4_K.
 ```
 Enables running models larger than a single node's 14 GiB via combined memory.
 
-### Speculative decoding (2× effective tg on predictable text)
-```bash
-./build/bin/llama-cli -m Qwen3.5-9B-Q4_K_M.gguf -md /path/to/Qwen3.5-0.8B-Q4.gguf \
-    -ngl 99 -ngld 99 --draft-max 8 --draft-min 2
-```
-Use a matched-tokenizer draft model. Acceptance rate ~88% on typical prompts gave us ~85 tok/s effective.
+### Speculative decoding: doesn't deliver on BC-250 (Vulkan)
+
+On this hardware we could not measure a speedup from speculative decoding via `llama-server` or `llama-speculative`:
+
+- **Qwen3.5 9B**: hybrid architecture (Gated Delta Net) blocks partial sequence removal — `llama-server` refuses to initialize speculative. Via the CLI tool the compat check passes but draft acceptance collapses to ~0.8% on a 0.8B draft.
+- **Llama 3.1 8B + Llama 3.2 1B**: 72% draft acceptance measured, but total wall-clock throughput is identical to non-speculative (~55 tok/s both). Theoretical math predicted ~1.9×.
+
+The gap points at the Vulkan backend's batched verify path, not BC-250 itself. A reader welcome to investigate upstream. This section is retained as a "we tried, here's what happened" note so future readers don't repeat the same experiment.
 
 ---
 
@@ -253,7 +255,7 @@ Step-by-step contribution of each change, measured on Qwen 3.5-9B Q4_K_M (BC-250
 
 ### Why you can trust the numbers
 
-- Perplexity on Qwen3-4B Q4_K held at **1.0455–1.0457 ± 0.0246** across every configuration we tested (baseline, full stack, with speculative, etc.). The ±0.025 error bar swamps the 0.0002 deltas — all configs are statistically indistinguishable.
+- Perplexity on Qwen3-4B Q4_K held at **1.0455–1.0457 ± 0.0246** across every configuration we tested (baseline vs full stack). The ±0.025 error bar swamps the 0.0002 deltas — all configs are statistically indistinguishable.
 - `test-backend-ops MUL_MAT` full sweep passes 938/938 on Vulkan.
 - Every optimization is mathematically equivalent (or FP-equivalent within 1 ULP rounding) to what upstream computes — we are not cutting corners, we are removing unnecessary overhead.
 

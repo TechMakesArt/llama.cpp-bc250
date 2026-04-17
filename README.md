@@ -81,7 +81,7 @@ Disabled by setting `GGML_VK_DISABLE_FUSION=1`.
 Setup checklist, in order:
 
 ### 1. BIOS
-A community-patched BIOS is required to unlock dynamic VRAM allocation. See [elektricM/amd-bc250-docs/bios](https://elektricm.github.io/amd-bc250-docs/bios/). All the docs for flashing are there. Do this first — nothing else works without it.
+A community-patched BIOS is required to unlock dynamic VRAM allocation. See [elektricM/amd-bc250-docs — BIOS flashing guide](https://elektricm.github.io/amd-bc250-docs/bios/flashing/). Do this first — nothing else works without it.
 
 ### 2. Linux kernel & drivers
 Ubuntu 24.04 (kernel 6.8+) with a recent Mesa (26.x) is known to work. Either install from the [kisak PPA](https://launchpad.net/~kisak/+archive/ubuntu/kisak-mesa) on Ubuntu, or follow [akandr/bc250](https://github.com/akandr/bc250) for their exact stack.

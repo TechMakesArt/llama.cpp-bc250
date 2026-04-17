@@ -185,6 +185,30 @@ The three optimizations in this fork apply automatically; there's nothing to ena
 
 ---
 
+## Which quant should I use?
+
+**Q4_K_M.** Measured on Qwen3.5 9B, same binary, governor on, `llama-bench -p 512 -n 128`:
+
+| Quant | Size | tg128 | vs Q4_K_M |
+|---|---|---|---|
+| IQ4_XS | 4.80 GiB | 42.39 | −23% |
+| IQ4_NL | 4.99 GiB | 54.19 | −1.5% |
+| Q4_K_S | 5.01 GiB | 55.39 | +0.7% |
+| **Q4_K_M** | **5.28 GiB** | **54.99** | **ref** |
+| Q5_K_M | 6.12 GiB | 47.19 | −14% |
+| Q6_K | 6.94 GiB | 44.38 | −19% |
+| Q8_0 | 8.86 GiB | 32.46 | −41% |
+
+Every quant from IQ4_NL through Q8_0 ends up at roughly the same effective memory bandwidth (~290 GB/s, about 65% of the 448 GB/s peak). That means tok/s is essentially just the inverse of file size — bigger file, fewer tokens per second for the same bandwidth. So choose quant on quality-per-bit, not speed.
+
+- **Q4_K_M**: the right default. Widely benchmarked quality sweet spot, near-top speed.
+- **IQ4_NL**: a solid alternative if you're short on VRAM. 0.3 GiB smaller than Q4_K_M at essentially the same speed.
+- **Q4_K_S**: marginally faster than Q4_K_M (0.7%) but noticeably lower quality. Not worth it unless you're boxed in on size.
+- **Avoid IQ4_XS**: despite being in the IQ family it falls off a cliff on gfx1013 — the per-block decode path is expensive without int-dot instructions, costing 23% throughput for only 0.2 GiB savings.
+- **Q5_K_M / Q6_K / Q8_0** are correct choices only if you truly need the extra quality at the cost of proportionally slower decode.
+
+The fusion kernel in this fork is Q4_K-specific, so only **Q4_K_M / Q4_K_S** actually fire the fused gate+up path. Other quants (IQ4_NL, IQ4_XS, Q5_K_M, Q6_K, Q8_0) fall through to the standard DMMV kernel but still benefit from the SMU governor, rm_kq=4 tuning, and the Q4_K smin fix when applicable.
+
 ## Recommended per-node usage
 
 ### Single user, interactive chat

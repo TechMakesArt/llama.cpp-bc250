@@ -185,6 +185,36 @@ The three optimizations in this fork apply automatically; there's nothing to ena
 
 ---
 
+## Featured model: Gemma 4 26B-A4B (MoE) — the sleeper pick
+
+If you're running BC-250 for quality over raw speed, the best single-node option we've tested is **Gemma 4 26B-A4B** at **UD-Q3_K_M** with KV cache quantized to q8_0. That's a mixture-of-experts with 25B total parameters but only ~4B active per token, so decode speed is closer to a 4B dense model than a 26B one:
+
+| Metric | Value |
+|---|---|
+| Size on disk | 11.65 GiB |
+| Total parameters | 25.2B |
+| Active per token | ~4B |
+| Decode (tg128) | **69.66 tok/s** |
+| Prompt eval (pp512) | **449.76 tok/s** |
+| Usable context | **24k** (with KV q8_0) |
+| Memory footprint | ~13 GB of 14 GB budget |
+
+**Quality validated**, not just speed:
+- 6-turn planning conversation with shifting constraints → tracked context perfectly, integrated all constraints correctly
+- 19k-token needle-in-haystack retrieval → **5/5** at depths 7%, 28%, 50%, 69%, 89%
+
+Recipe:
+```bash
+llama-server -m gemma-4-26B-A4B-it-UD-Q3_K_M.gguf \
+    -ngl 99 -t 4 -c 24576 --parallel 1 \
+    -ctk q8_0 -ctv q8_0 -fa on \
+    --host 0.0.0.0 --port 8081
+```
+
+The `-ctk q8_0 -ctv q8_0` flags quantize the attention KV cache to 8-bit — that's the single biggest lever for extending context on memory-limited hardware. Gemma 4's sliding-window attention means KV stays efficient even at 24k. `-fa on` enables flash attention for a smaller compute buffer.
+
+Why this rather than a dense 9B? Quality. 25B-class reasoning on a $150 card is the surprising part. Why not Q4 or Q5? At Q4_K_M the 26B-A4B is 16.87 GB, overflows the 14 GB budget. UD-Q3_K_M is the sweet spot that fits with real context room.
+
 ## Which quant should I use?
 
 **Q4_K_M.** Measured on Qwen3.5 9B, same binary, governor on, `llama-bench -p 512 -n 128`:
